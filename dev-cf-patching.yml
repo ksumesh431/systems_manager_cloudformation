@@ -1,0 +1,269 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "patching_cloudformation"
+
+Parameters:
+  Name:
+    Type: String
+  RebootTagKey:
+    Type: String
+    Default: "ssmpatch"
+    Description: "Tag value for reboot instance by Maintainence_Window"
+  RebootTagValue:
+    Type: String
+    Default: "reboot"
+    Description: "Tag value for reboot instance by Maintainence_Window"
+  MaxConcurrency:
+    Type: String
+    Default: "2"
+    Description: "No. of instances to be rebooted at a time"
+
+  PatchingTagKey:
+    Type: String
+    Default: "patching"
+    Description: "Tag key for patching instance by Maintainence_Window"
+
+  PatchingTagValue:
+    Type: String
+    Default: "true"
+    Description: "Tag value for patching instance by Maintainence_Window"
+
+  PatchingTaskType:
+    Type: String
+    Default: "Scan"
+  # SSMIAMRole:
+  #   Type: String
+  CronSchedule:
+    Type: String
+  ScheduleTimezone:
+    Default: "America/New_York"
+    Type: String
+
+  CreateSSMDocument:
+    Type: String
+    Default: "yes"
+    AllowedValues:
+      - "yes"
+      - "no"
+    Description: If the account already have the reboot-ssm-document, select No.
+
+Conditions:
+  ShouldCreateSSMDocument: !Equals [!Ref CreateSSMDocument, "yes"]
+
+Resources:
+  MyIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CfnEC2MaintainenceSSMRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ssm.amazonaws.com
+                - ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+
+  SSMMaintenanceWindow:
+    Type: "AWS::SSM::MaintenanceWindow"
+    Properties:
+      Name: !Sub "${Name}-Maintainence_Window"
+      Description: !Sub "${Name}-Maintainence_Window"
+      Schedule: !Ref CronSchedule
+      ScheduleTimezone: !Ref ScheduleTimezone
+      Duration: 5
+      Cutoff: 1
+      AllowUnassociatedTargets: false
+
+  SSMMaintenanceWindowTarget:
+    Type: "AWS::SSM::MaintenanceWindowTarget"
+    Properties:
+      WindowId: !Ref SSMMaintenanceWindow
+      ResourceType: "INSTANCE"
+      Targets:
+        - Key: !Sub "tag:${PatchingTagKey}"
+          Values:
+            - !Ref PatchingTagValue
+      Name: "PatchingTarget"
+      Description: "Instances that have the following tag key"
+
+  SSMMaintenanceWindowRestartInstancesTarget:
+    Type: "AWS::SSM::MaintenanceWindowTarget"
+    Properties:
+      WindowId: !Ref SSMMaintenanceWindow
+      ResourceType: "INSTANCE"
+      Targets:
+        - Key: !Sub "tag:${RebootTagKey}"
+          Values:
+            - !Ref RebootTagValue
+      Name: "rebootInstances"
+      Description: "Instances to be rebooted that have the tag key: ssmpatch with value: reboot"
+
+  SSMMaintenanceWindowPatchingTask:
+    Type: "AWS::SSM::MaintenanceWindowTask"
+    Properties:
+      WindowId: !Ref SSMMaintenanceWindow
+      Targets:
+        - Key: "WindowTargetIds"
+          Values:
+            - !Ref SSMMaintenanceWindowTarget
+      TaskArn: "AWS-RunPatchBaseline"
+      ServiceRoleArn: !GetAtt MyIAMRole.Arn
+      TaskType: "RUN_COMMAND"
+      TaskParameters:
+        Operation:
+          Values:
+            - Install
+      Priority: 2
+      MaxConcurrency: "100"
+      MaxErrors: "0"
+      Name: "PatchingTask"
+      TaskInvocationParameters:
+        MaintenanceWindowRunCommandParameters:
+          Parameters:
+            SnapshotId:
+              - "{{WINDOW_EXECUTION_ID}}"
+            Operation:
+              - !Ref PatchingTaskType
+            RebootOption:
+              - "NoReboot"
+          TimeoutSeconds: 1800
+
+  RebootTask:
+    Type: "AWS::SSM::MaintenanceWindowTask"
+    Properties:
+      WindowId: !Ref SSMMaintenanceWindow
+      Targets:
+        - Key: "WindowTargetIds"
+          Values:
+            - !Ref SSMMaintenanceWindowRestartInstancesTarget
+      TaskArn: !Ref SSMDocumentForReboot
+      ServiceRoleArn: !GetAtt MyIAMRole.Arn
+      TaskType: "RUN_COMMAND"
+      TaskParameters: {}
+      Priority: 3
+      MaxConcurrency: !Ref MaxConcurrency
+      MaxErrors: 1
+      Name: "Reboot"
+      TaskInvocationParameters:
+        MaintenanceWindowRunCommandParameters:
+          Comment: ""
+          DocumentVersion: "$DEFAULT"
+          TimeoutSeconds: 600
+
+  RenameTask:
+    Type: "AWS::SSM::MaintenanceWindowTask"
+    Properties:
+      WindowId: !Ref SSMMaintenanceWindow
+      Targets:
+        - Key: "WindowTargetIds"
+          Values:
+            - !Ref SSMMaintenanceWindowTarget
+      TaskArn: !Ref SSMDocumentForRenamingCredFile
+      ServiceRoleArn: !GetAtt MyIAMRole.Arn
+      TaskType: "RUN_COMMAND"
+      TaskParameters: {}
+      Priority: 1
+      MaxConcurrency: !Ref MaxConcurrency
+      MaxErrors: 1
+      Name: "RenameCredFile"
+      TaskInvocationParameters:
+        MaintenanceWindowRunCommandParameters:
+          Comment: ""
+          DocumentVersion: "$DEFAULT"
+          TimeoutSeconds: 600
+
+  RenameBackTask:
+    Type: "AWS::SSM::MaintenanceWindowTask"
+    Properties:
+      WindowId: !Ref SSMMaintenanceWindow
+      Targets:
+        - Key: "WindowTargetIds"
+          Values:
+            - !Ref SSMMaintenanceWindowTarget
+      TaskArn: !Ref SSMDocumentForRenamingBackCredFile
+      ServiceRoleArn: !GetAtt MyIAMRole.Arn
+      TaskType: "RUN_COMMAND"
+      TaskParameters: {}
+      Priority: 4
+      MaxConcurrency: !Ref MaxConcurrency
+      MaxErrors: 1
+      Name: "RenameBackCredFile"
+      TaskInvocationParameters:
+        MaintenanceWindowRunCommandParameters:
+          Comment: ""
+          DocumentVersion: "$DEFAULT"
+          TimeoutSeconds: 600
+
+  SSMDocumentForReboot:
+    Type: "AWS::SSM::Document"
+    Condition: ShouldCreateSSMDocument
+    Properties:
+      Name: "reboot-ssm-document-v2"
+      Content:
+        schemaVersion: "2.2"
+        description: "Reboot instances manually"
+        mainSteps:
+          - action: "aws:runShellScript"
+            name: "runCustomScript"
+            inputs:
+              runCommand:
+                - |
+                  UPTIME_SECONDS=$(awk '{print $1}' /proc/uptime)
+                  UPTIME_SECONDS=${UPTIME_SECONDS%.*}
+                  echo "uptime: $UPTIME_SECONDS seconds"
+                  if [ -f /var/run/reboot-required ]; then
+                    echo "/var/run/reboot-required file found"
+                    if [ $UPTIME_SECONDS -gt 600 ]; then
+                      echo "rebooting due to uptime greater than 600 seconds ..."
+                      exit 194
+                    else
+                      echo "uptime less than 600 seconds, no reboot required"
+                    fi
+                  else
+                    echo "reboot not required as the package reboot file is not there"
+                  fi
+                  echo "done"
+      DocumentType: "Command"
+
+  SSMDocumentForRenamingCredFile:
+    Type: "AWS::SSM::Document"
+    Condition: ShouldCreateSSMDocument
+    Properties:
+      Name: "boto-cred-rename-ssm-document"
+      Content:
+        schemaVersion: "2.2"
+        description: "Renames the /etc/boto.cfg cred file if it exists"
+        mainSteps:
+          - action: "aws:runShellScript"
+            name: "runCustomScript"
+            inputs:
+              runCommand:
+                - |
+                  if [ -f /etc/boto.cfg ]; then
+                    echo "Config file found hence renaming the config file"
+                    mv /etc/boto.cfg /etc/boto.cfg_bak
+                  fi
+      DocumentType: "Command"
+
+  SSMDocumentForRenamingBackCredFile:
+    Type: "AWS::SSM::Document"
+    Condition: ShouldCreateSSMDocument
+    Properties:
+      Name: "boto-cred-rename-back-ssm-document"
+      Content:
+        schemaVersion: "2.2"
+        description: "Renames the /etc/boto.cfg_bak cred file to /etc/boto.cfg"
+        mainSteps:
+          - action: "aws:runShellScript"
+            name: "runCustomScript"
+            inputs:
+              runCommand:
+                - |
+                  if [ -f /etc/boto.cfg_bak ]; then
+                    echo "Renamed config file found hence renaming back to original name"
+                    mv /etc/boto.cfg_bak /etc/boto.cfg
+                  fi
+      DocumentType: "Command"
